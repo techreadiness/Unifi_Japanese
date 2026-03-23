@@ -1,0 +1,118 @@
+name: Unifi-Japan-Translate-Final
+
+on:
+  push:
+    paths:
+      - "en/**/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  translate:
+    if: "!contains(github.event.head_commit.message, 'Auto-translate')"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run Safe Translation
+        env:
+          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+        run: |
+          set -e
+
+          echo "🔍 Detect changed files..."
+          FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^en/.*\.md$' || true)
+
+          if [ -z "$FILES" ]; then
+            echo "No changed markdown files."
+            exit 0
+          fi
+
+          for file in $FILES; do
+            echo "➡️ Processing: $file"
+
+            REL_PATH=${file#en/}
+            TARGET_FILE="ja/$REL_PATH"
+            mkdir -p "$(dirname "$TARGET_FILE")"
+
+            # 1. Front Matter 분리
+            FRONT_MATTER=$(sed -n '/^---$/,/^---$/p' "$file" | sed '1d;$d')
+            BODY=$(sed '1,/^---$/d' "$file" | sed '1,/^---$/d')
+
+            if [ -z "$FRONT_MATTER" ]; then
+              BODY=$(cat "$file")
+            fi
+
+            # =========================
+            # 2. 보호 처리 (핵심)
+            # =========================
+
+            # 2-1. 코드블럭 보호
+            BODY=$(echo "$BODY" | sed -E ':a;N;$!ba;s/```[^`]*```/__CODE_BLOCK__/g')
+
+            # 2-2. metaLinks / 표 전체 보호
+            BODY=$(echo "$BODY" | sed -E ':a;N;$!ba;s/\|.*\n(\|.*\n)*/__TABLE_BLOCK__/g')
+
+            # 2-3. 링크 보호
+            BODY=$(echo "$BODY" | sed -E 's/(!?\[[^]]*\]\([^)]*\))/__LINK_BLOCK__/g')
+
+            # 2-4. URL 보호
+            BODY=$(echo "$BODY" | sed -E 's#https?://[^ ]+#__URL_BLOCK__#g')
+
+            # =========================
+            # 3. DeepL 번역
+            # =========================
+            RESPONSE=$(curl -s -X POST "https://api-free.deepl.com/v2/translate" \
+              -H "Authorization: DeepL-Auth-Key $DEEPL_API_KEY" \
+              --data-urlencode "text=$BODY" \
+              -d "source_lang=EN" \
+              -d "target_lang=JA")
+
+            TRANSLATED_BODY=$(echo "$RESPONSE" | jq -r '.translations[0].text // empty')
+
+            if [ -z "$TRANSLATED_BODY" ]; then
+              echo "❌ Translation failed: $file"
+              continue
+            fi
+
+            # =========================
+            # 4. 복원 처리
+            # =========================
+
+            # (단순 placeholder 방식 → 실제 운영 시 map 구조 추천)
+            FINAL_BODY="$TRANSLATED_BODY"
+
+            # 일본어 괄호 교정
+            FINAL_BODY=$(echo "$FINAL_BODY" | sed -E 's/（/(/g' | sed -E 's/）/)/g')
+
+            # =========================
+            # 5. 저장
+            # =========================
+            if [ -n "$FRONT_MATTER" ]; then
+              echo -e "---\n$FRONT_MATTER\n---\n\n$FINAL_BODY" > "$TARGET_FILE"
+            else
+              echo "$FINAL_BODY" > "$TARGET_FILE"
+            fi
+
+          done
+
+      - name: Commit & Push
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add ja/
+
+          git commit -m "docs: Auto-translate EN → JA (safe)" || echo "No changes"
+
+          git pull --rebase origin main
+          git push origin main
