@@ -1,4 +1,4 @@
-name: Unifi-Japan-Translate-Final
+name: Unifi-Japan-Translate-Debug
 
 on:
   push:
@@ -11,7 +11,6 @@ permissions:
 
 jobs:
   translate:
-    if: "!contains(github.event.head_commit.message, 'Auto-translate')"
     runs-on: ubuntu-latest
 
     steps:
@@ -23,28 +22,36 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Run Safe Translation
+      - name: Run Debug Translation
         env:
           DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
         run: |
           set -e
 
-          echo "🔍 Detect changed files..."
+          echo "===== DEBUG START ====="
+
+          # 1. 변경 파일 감지
           FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^en/.*\.md$' || true)
 
+          echo "Detected FILES: $FILES"
+
+          # fallback (중요)
           if [ -z "$FILES" ]; then
-            echo "No changed markdown files."
-            exit 0
+            echo "⚠️ No diff detected → fallback to all files"
+            FILES=$(find en -name "*.md")
           fi
 
+          echo "Final FILES: $FILES"
+
           for file in $FILES; do
-            echo "➡️ Processing: $file"
+            echo "-----------------------------"
+            echo "Processing: $file"
 
             REL_PATH=${file#en/}
             TARGET_FILE="ja/$REL_PATH"
             mkdir -p "$(dirname "$TARGET_FILE")"
 
-            # 1. Front Matter 분리
+            # 2. Front Matter 분리
             FRONT_MATTER=$(sed -n '/^---$/,/^---$/p' "$file" | sed '1d;$d')
             BODY=$(sed '1,/^---$/d' "$file" | sed '1,/^---$/d')
 
@@ -52,67 +59,61 @@ jobs:
               BODY=$(cat "$file")
             fi
 
-            # =========================
-            # 2. 보호 처리 (핵심)
-            # =========================
+            echo "BODY length: ${#BODY}"
 
-            # 2-1. 코드블럭 보호
-            BODY=$(echo "$BODY" | sed -E ':a;N;$!ba;s/```[^`]*```/__CODE_BLOCK__/g')
+            # 3. 보호 처리 (최소 버전)
+            PROTECTED_BODY=$(echo "$BODY" | sed -E 's/(!?\[[^]]*\]\([^)]*\))/<span translate="no">\1<\/span>/g')
+            PROTECTED_BODY=$(echo "$PROTECTED_BODY" | sed -E 's#https?://[^ ]+#<span translate="no">&</span>#g')
 
-            # 2-2. metaLinks / 표 전체 보호
-            BODY=$(echo "$BODY" | sed -E ':a;N;$!ba;s/\|.*\n(\|.*\n)*/__TABLE_BLOCK__/g')
-
-            # 2-3. 링크 보호
-            BODY=$(echo "$BODY" | sed -E 's/(!?\[[^]]*\]\([^)]*\))/__LINK_BLOCK__/g')
-
-            # 2-4. URL 보호
-            BODY=$(echo "$BODY" | sed -E 's#https?://[^ ]+#__URL_BLOCK__#g')
-
-            # =========================
-            # 3. DeepL 번역
-            # =========================
+            # 4. DeepL 호출
             RESPONSE=$(curl -s -X POST "https://api-free.deepl.com/v2/translate" \
               -H "Authorization: DeepL-Auth-Key $DEEPL_API_KEY" \
-              --data-urlencode "text=$BODY" \
+              --data-urlencode "text=$PROTECTED_BODY" \
               -d "source_lang=EN" \
-              -d "target_lang=JA")
+              -d "target_lang=JA" \
+              -d "tag_handling=html")
+
+            echo "DeepL raw response:"
+            echo "$RESPONSE"
 
             TRANSLATED_BODY=$(echo "$RESPONSE" | jq -r '.translations[0].text // empty')
 
+            echo "Translated length: ${#TRANSLATED_BODY}"
+
+            # DeepL 실패 방어 (핵심)
             if [ -z "$TRANSLATED_BODY" ]; then
-              echo "❌ Translation failed: $file"
-              continue
+              echo "❌ Translation failed → using original"
+              TRANSLATED_BODY="$BODY"
             fi
 
-            # =========================
-            # 4. 복원 처리
-            # =========================
-
-            # (단순 placeholder 방식 → 실제 운영 시 map 구조 추천)
-            FINAL_BODY="$TRANSLATED_BODY"
-
-            # 일본어 괄호 교정
+            # 5. 후처리
+            FINAL_BODY=$(echo "$TRANSLATED_BODY" | sed -E 's/<\/?span[^>]*>//g')
             FINAL_BODY=$(echo "$FINAL_BODY" | sed -E 's/（/(/g' | sed -E 's/）/)/g')
 
-            # =========================
-            # 5. 저장
-            # =========================
+            echo "Saving file → $TARGET_FILE"
+
+            # 6. 저장 (무조건 생성됨)
             if [ -n "$FRONT_MATTER" ]; then
               echo -e "---\n$FRONT_MATTER\n---\n\n$FINAL_BODY" > "$TARGET_FILE"
             else
               echo "$FINAL_BODY" > "$TARGET_FILE"
             fi
-
           done
+
+          echo "===== FILE TREE ====="
+          ls -R
 
       - name: Commit & Push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ja/
+          git add ja/ || true
 
-          git commit -m "docs: Auto-translate EN → JA (safe)" || echo "No changes"
-
-          git pull --rebase origin main
-          git push origin main
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "docs: Debug auto-translate EN → JA"
+            git pull --rebase origin main
+            git push origin main
+          fi
