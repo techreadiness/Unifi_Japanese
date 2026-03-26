@@ -2,8 +2,7 @@ name: Unifi-Japan-Translate-Stable
 
 on:
   push:
-    paths:
-      - "**/*.md"
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -24,78 +23,74 @@ jobs:
         env:
           DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
         run: |
-          set -e
+          set +e   # ❗ 절대 중간에 죽지 않게
 
-          echo "===== FIND FILES ====="
+          echo "===== START TRANSLATION ====="
+
           FILES=$(find . -name "*.md" \
             -not -path "./ja/*" \
             -not -path "./.git/*" \
             -not -path "./.github/*")
 
-          echo "$FILES"
-
           for file in $FILES; do
             echo "Processing $file..."
 
-            REL_PATH=${file#./}
-            TARGET_FILE="ja/$REL_PATH"
-
-            mkdir -p "$(dirname "$TARGET_FILE")"
-
-            # 1. Front Matter 보호
-            FRONT_MATTER=$(awk 'BEGIN{flag=0} /^---$/{if(flag==0){flag=1; next} else{exit}} flag==1{print}' "$file")
-            BODY=$(awk 'BEGIN{flag=0} /^---$/{if(flag==0){flag=1; next} else{flag=2; next}} flag==2{print}' "$file")
-
-            if [ -z "$FRONT_MATTER" ]; then
-              BODY=$(cat "$file")
+            # 빈 파일 스킵
+            if [ ! -s "$file" ]; then
+              echo "Skip empty file"
+              continue
             fi
 
-            # 2. 보호 처리 (중요)
-            PROTECTED_BODY="$BODY"
+            REL_PATH=${file#./}
+            TARGET_FILE="ja/$REL_PATH"
+            mkdir -p "$(dirname "$TARGET_FILE")"
 
-            # URL 보호
-            PROTECTED_BODY=$(echo "$PROTECTED_BODY" | sed -E 's|(https?://[^ ]+)|<span translate="no">\1</span>|g')
+            CONTENT=$(cat "$file")
 
-            # Markdown 링크 보호
-            PROTECTED_BODY=$(echo "$PROTECTED_BODY" | sed -E 's|(!?\[[^]]*\]\([^)]*\))|<span translate="no">\1</span>|g')
+            # --------------------------------
+            # 🔒 보호 처리 (핵심)
+            # --------------------------------
 
-            # metaLinks / alternates 보호
-            PROTECTED_BODY=$(echo "$PROTECTED_BODY" | sed -E 's|\b(metaLinks|alternates)\b|<span translate="no">\1</span>|g')
+            PROTECTED=$(echo "$CONTENT" | sed -E '
+              s|(https?://[^ ]+)|<span translate="no">\1</span>|g;
+              s|(!?\[[^]]*\]\([^)]*\))|<span translate="no">\1</span>|g;
+              s|(\|.*\|)|<span translate="no">\1</span>|g;
+              s|(metaLinks|alternates)|<span translate="no">\1</span>|g;
+            ')
 
-            # Unifi 고유명사 보호
-            PROTECTED_BODY=$(echo "$PROTECTED_BODY" | sed 's/Unifi/<span translate="no">Unifi<\/span>/g')
+            # --------------------------------
+            # 🌍 DeepL 번역
+            # --------------------------------
 
-            # 3. DeepL 번역
             RESPONSE=$(curl -s -X POST "https://api-free.deepl.com/v2/translate" \
               -H "Authorization: DeepL-Auth-Key $DEEPL_API_KEY" \
-              --data-urlencode "text=$PROTECTED_BODY" \
+              --data-urlencode "text=$PROTECTED" \
               -d "source_lang=EN" \
               -d "target_lang=JA" \
               -d "tag_handling=html" \
               -d "preserve_formatting=1")
 
-            TRANSLATED_BODY=$(echo "$RESPONSE" | jq -r '.translations[0].text // empty')
+            TRANSLATED=$(echo "$RESPONSE" | jq -r '.translations[0].text // empty')
 
-            if [ -z "$TRANSLATED_BODY" ]; then
-              echo "❌ Translation failed for $file"
+            # 번역 실패 시 스킵
+            if [ -z "$TRANSLATED" ]; then
+              echo "❌ Translation failed"
               continue
             fi
 
-            # 4. 후처리
-            FINAL_BODY=$(echo "$TRANSLATED_BODY" | sed -E 's/<\/?span[^>]*>//g')
+            # --------------------------------
+            # 🧹 후처리
+            # --------------------------------
 
-            # 일본어 괄호 깨짐 복구
-            FINAL_BODY=$(echo "$FINAL_BODY" | sed -E 's/（/(/g' | sed -E 's/）/)/g')
+            FINAL=$(echo "$TRANSLATED" | sed -E '
+              s|</?span[^>]*>||g;
+              s|（|(|g;
+              s|）|)|g;
+              s|(!?\[[^]]*\]) *\(([^)]*)\)|\1(\2)|g;
+            ')
 
-            # 링크 공백 복구
-            FINAL_BODY=$(echo "$FINAL_BODY" | sed -E 's/(!?\[[^]]*\]) *\(([^)]*)\)/\1(\2)/g')
-
-            # 5. 저장
-            if [ -n "$FRONT_MATTER" ]; then
-              echo -e "---\n$FRONT_MATTER\n---\n\n$FINAL_BODY" > "$TARGET_FILE"
-            else
-              echo "$FINAL_BODY" > "$TARGET_FILE"
-            fi
+            echo "$FINAL" > "$TARGET_FILE"
+            echo "✅ Saved -> $TARGET_FILE"
 
           done
 
@@ -106,6 +101,5 @@ jobs:
 
           git add ja/
 
-          git commit -m "docs: Auto-translate EN to JA (stable)" || echo "No changes"
-
-          git push
+          git diff --quiet && git diff --staged --quiet || \
+          (git commit -m "docs: stable auto-translate EN → JA" && git push)
